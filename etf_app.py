@@ -14,11 +14,6 @@ st.set_page_config(
     layout="wide",
 )
 
-SHEET_ID = "1N7pHQgFqBcgNXIup-tFj40Al2jczS-f0eZ8XgW0wIMU"
-SHEET_GID = "280536315"
-SHEET_EDIT_URL = f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/edit?gid={SHEET_GID}#gid={SHEET_GID}"
-SHEET_CSV_URL = f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/export?format=csv&gid={SHEET_GID}"
-
 HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -26,6 +21,27 @@ HEADERS = {
     ),
     "Referer": "https://m.stock.naver.com/",
 }
+
+
+def get_sheet_urls() -> tuple[str, str]:
+    """Streamlit Secrets에서 구글 시트 ID와 GID를 안전하게 읽어 URL을 반환합니다."""
+    try:
+        sheet_id = str(st.secrets["GOOGLE_SHEET_ID"]).strip()
+        sheet_gid = str(st.secrets.get("GOOGLE_SHEET_GID", "0")).strip()
+    except Exception as exc:
+        raise ValueError(
+            "Streamlit Secrets에 'GOOGLE_SHEET_ID'가 설정되어 있지 않습니다. "
+            "로컬(.streamlit/secrets.toml) 또는 Streamlit Cloud Secrets에 설정해 주세요."
+        ) from exc
+    if not sheet_id:
+        raise ValueError("Streamlit Secrets의 'GOOGLE_SHEET_ID' 값이 비어 있습니다.")
+    edit_url = (
+        f"https://docs.google.com/spreadsheets/d/{sheet_id}/edit?gid={sheet_gid}#gid={sheet_gid}"
+    )
+    csv_url = (
+        f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=csv&gid={sheet_gid}"
+    )
+    return edit_url, csv_url
 
 
 def parse_weight_pct(raw_val: Any) -> float:
@@ -39,9 +55,9 @@ def parse_weight_pct(raw_val: Any) -> float:
 
 
 @st.cache_data(ttl=300, show_spinner=False)
-def load_portfolio_from_sheet() -> list[dict[str, Any]]:
+def load_portfolio_from_sheet(csv_url: str) -> list[dict[str, Any]]:
     """구글 시트(퇴직연금v1 / Code 시트)에서 ETF 종목코드와 포트폴리오 비중(%)을 읽어옵니다."""
-    resp = requests.get(SHEET_CSV_URL, headers={"User-Agent": HEADERS["User-Agent"]}, timeout=10)
+    resp = requests.get(csv_url, headers={"User-Agent": HEADERS["User-Agent"]}, timeout=10)
     if resp.status_code != 200:
         raise ValueError(
             f"구글 시트를 불러오지 못했습니다 (HTTP {resp.status_code}). "
@@ -271,13 +287,20 @@ def to_csv_bytes(df: pd.DataFrame) -> bytes:
 
 
 # --- UI ---
+try:
+    sheet_edit_url, sheet_csv_url = get_sheet_urls()
+except ValueError as exc:
+    st.title("📊 퇴직연금 ETF 구성종목 및 실제 비중 분석")
+    st.error(str(exc))
+    st.stop()
+
 header_col, btn_col = st.columns([5, 1])
 with header_col:
     st.title("📊 퇴직연금 ETF 구성종목 및 실제 비중 분석")
     st.caption(
         f"구글 시트(`퇴직연금v1` · `Code` 시트)에 등록된 ETF 종목코드와 포트폴리오 비중을 자동으로 불러와 "
         f"상위 구성종목, 1개월 수익률, 개별 종목의 전체 실제 비중(%)을 계산합니다. "
-        f"([시트 열기]({SHEET_EDIT_URL}))"
+        f"([시트 열기]({sheet_edit_url}))"
     )
 with btn_col:
     st.write("")
@@ -288,7 +311,7 @@ with btn_col:
 
 try:
     with st.spinner("구글 시트에서 포트폴리오 목록을 불러오는 중입니다..."):
-        portfolio_items = load_portfolio_from_sheet()
+        portfolio_items = load_portfolio_from_sheet(sheet_csv_url)
 except Exception as exc:
     st.error(f"구글 시트 로드 오류: {exc}")
     st.stop()
