@@ -132,6 +132,7 @@ def fetch_etf_data(code: str, portfolio_weight: float) -> dict[str, Any]:
                 "보유비중(%)": weight,
                 "실제 기여 비중(%)": actual_weight,
                 "1개월 수익률(%)": None,
+                "1개월 추이": [],
                 "CU단위수량": f"{cu_qty:,.2f} {cu_unit}".strip() if cu_qty is not None else "-",
                 "_match_key": stock_code if stock_code else stock_name,
                 "_is_domestic": is_domestic,
@@ -152,10 +153,10 @@ def fetch_etf_data(code: str, portfolio_weight: float) -> dict[str, Any]:
 
 
 @st.cache_data(ttl=1800, show_spinner=False)
-def fetch_1m_return(stock_code: str, is_domestic: bool) -> float | None:
-    """네이버 금융 일별 차트 API를 사용해 최근 1개월(약 30일) 수익률(%)을 계산합니다."""
+def fetch_1m_return_and_trend(stock_code: str, is_domestic: bool) -> tuple[float | None, list[float]]:
+    """네이버 금융 일별 차트 API를 사용해 최근 1개월(약 30일) 수익률(%)과 일별 추이(%)를 반환합니다."""
     if not stock_code:
-        return None
+        return None, []
     kind = "domestic" if is_domestic else "foreign"
     end_dt = datetime.now()
     start_dt = end_dt - timedelta(days=45)
@@ -166,13 +167,13 @@ def fetch_1m_return(stock_code: str, is_domestic: bool) -> float | None:
     try:
         resp = requests.get(url, headers=HEADERS, timeout=8)
         if resp.status_code != 200:
-            return None
+            return None, []
         rows = resp.json()
         if not isinstance(rows, list) or len(rows) < 2:
-            return None
+            return None, []
         valid = [r for r in rows if r.get("localDate") and r.get("closePrice") is not None]
         if len(valid) < 2:
-            return None
+            return None, []
 
         latest = valid[-1]
         end_date = datetime.strptime(latest["localDate"], "%Y%m%d")
@@ -184,24 +185,31 @@ def fetch_1m_return(stock_code: str, is_domestic: bool) -> float | None:
         p_start = float(base["closePrice"])
         p_end = float(latest["closePrice"])
         if p_start <= 0:
-            return None
-        return round((p_end - p_start) / p_start * 100.0, 2)
+            return None, []
+
+        base_idx = valid.index(base)
+        trend_rows = valid[base_idx:]
+        trend = [
+            round((float(r["closePrice"]) - p_start) / p_start * 100.0, 2)
+            for r in trend_rows
+        ]
+        return round((p_end - p_start) / p_start * 100.0, 2), trend
     except Exception:
-        return None
+        return None, []
 
 
 def enrich_holdings_with_returns(etf_infos: list[dict[str, Any]]) -> None:
-    """모든 구성종목의 고유 티커를 병렬 조회하여 1개월 수익률(%)을 채웁니다."""
-    targets: dict[tuple[str, bool], float | None] = {}
+    """모든 구성종목의 고유 티커를 병렬 조회하여 1개월 수익률(%)과 일별 추이를 채웁니다."""
+    targets: dict[tuple[str, bool], tuple[float | None, list[float]]] = {}
     for info in etf_infos:
         for h in info["holdings"]:
             code = h["구성종목코드"]
             if code:
-                targets[(code, bool(h["_is_domestic"]))] = None
+                targets[(code, bool(h["_is_domestic"]))] = (None, [])
 
     with ThreadPoolExecutor(max_workers=8) as executor:
         future_map = {
-            executor.submit(fetch_1m_return, code, is_dom): (code, is_dom)
+            executor.submit(fetch_1m_return_and_trend, code, is_dom): (code, is_dom)
             for code, is_dom in targets
         }
         for future in as_completed(future_map):
@@ -209,12 +217,14 @@ def enrich_holdings_with_returns(etf_infos: list[dict[str, Any]]) -> None:
             try:
                 targets[key] = future.result()
             except Exception:
-                targets[key] = None
+                targets[key] = (None, [])
 
     for info in etf_infos:
         for h in info["holdings"]:
             key = (h["구성종목코드"], bool(h["_is_domestic"]))
-            h["1개월 수익률(%)"] = targets.get(key)
+            ret_pct, trend = targets.get(key, (None, []))
+            h["1개월 수익률(%)"] = ret_pct
+            h["1개월 추이"] = trend
 
 
 def build_overlap_table(
@@ -235,6 +245,7 @@ def build_overlap_table(
             구성종목명=("구성종목명", "first"),
             구성종목코드=("구성종목코드", "first"),
             수익률_1M=("1개월 수익률(%)", "first"),
+            추이_1M=("1개월 추이", "first"),
             편입_ETF_수=("ETF코드", "nunique"),
             전체_실제_비중=("실제 기여 비중(%)", "sum"),
         )
@@ -261,6 +272,7 @@ def build_overlap_table(
         columns={
             "편입_ETF_수": "편입 ETF 수",
             "수익률_1M": "1개월 수익률(%)",
+            "추이_1M": "1개월 추이",
             "전체_실제_비중": "전체 실제 비중(%)",
         }
     )
@@ -271,6 +283,7 @@ def build_overlap_table(
         "구성종목명",
         "구성종목코드",
         "1개월 수익률(%)",
+        "1개월 추이",
         "편입 ETF 수",
         "전체 실제 비중(%)",
         *etf_col_names,
@@ -349,15 +362,8 @@ if not etf_infos:
 with st.spinner("구성종목별 지난 1개월 수익률을 조회하는 중입니다..."):
     enrich_holdings_with_returns(etf_infos)
 
-# 전체 데이터프레임 생성
-all_rows = [row for info in etf_infos for row in info["holdings"]]
-all_df = pd.DataFrame(all_rows)
-export_df = all_df.drop(columns=["_match_key", "_is_domestic"])
-
-# 1. ETF 요약 정보
-st.subheader("1. 조회된 ETF 개요 (구글 시트 기준)")
-total_etf_weight = sum(info["portfolio_weight"] for info in etf_infos)
-st.caption(f"조회된 ETF **{len(etf_infos)}개** · 시트 내 ETF 비중 합계: **{total_etf_weight:.2f}%**")
+# 1. ETF 요약 정보 (포트폴리오 비중 실시간 시뮬레이션 지원)
+st.subheader("1. 조회된 ETF 개요 (포트폴리오 비중 직접 수정 가능)")
 
 summary_rows = []
 for info in etf_infos:
@@ -374,17 +380,58 @@ for info in etf_infos:
             "상위 10종목 비중 합계(%)": round(top_weight_sum, 2),
         }
     )
-st.dataframe(
+
+edited_summary_df = st.data_editor(
     pd.DataFrame(summary_rows),
-    use_container_width=True,
+    width="stretch",
     hide_index=True,
+    key="portfolio_weight_editor",
+    disabled=[
+        "종목코드",
+        "ETF명",
+        "현재가(원)",
+        "NAV(원)",
+        "등락률(%)",
+        "총 편입종목 수",
+        "상위 10종목 비중 합계(%)",
+    ],
     column_config={
-        "포트폴리오 비중(%)": st.column_config.NumberColumn("포트폴리오 비중(%)", format="%.2f%%"),
+        "포트폴리오 비중(%)": st.column_config.NumberColumn(
+            "포트폴리오 비중(%)",
+            help="값을 수정하면 아래 구성종목 실제 비중이 즉시 다시 계산됩니다.",
+            min_value=0.0,
+            max_value=100.0,
+            step=0.5,
+            format="%.2f%%",
+        ),
         "상위 10종목 비중 합계(%)": st.column_config.NumberColumn(
             "상위 10종목 비중 합계(%)", format="%.2f%%"
         ),
     },
 )
+
+# 수정된 포트폴리오 비중을 반영하여 실제 기여 비중 재계산
+edited_weights = {
+    str(row["종목코드"]): float(row["포트폴리오 비중(%)"] or 0.0)
+    for _, row in edited_summary_df.iterrows()
+}
+for info in etf_infos:
+    w = round(edited_weights.get(info["code"], info["portfolio_weight"]), 2)
+    info["portfolio_weight"] = w
+    for h in info["holdings"]:
+        h["ETF 비중(%)"] = w
+        h["실제 기여 비중(%)"] = round((w / 100.0) * h["보유비중(%)"], 4)
+
+total_etf_weight = sum(info["portfolio_weight"] for info in etf_infos)
+st.caption(
+    f"조회된 ETF **{len(etf_infos)}개** · 현재 적용된 ETF 비중 합계: **{total_etf_weight:.2f}%** "
+    "(표의 `포트폴리오 비중(%)` 셀을 더블클릭해 수정하면 아래 분석에 즉시 반영됩니다.)"
+)
+
+# 전체 데이터프레임 생성
+all_rows = [row for info in etf_infos for row in info["holdings"]]
+all_df = pd.DataFrame(all_rows)
+export_df = all_df.drop(columns=["_match_key", "_is_domestic"])
 
 # 2. ETF별 상위 구성종목 리스트 및 한눈에 보는 표
 st.subheader("2. ETF별 상위 구성종목 및 보유 비중(%)")
@@ -401,11 +448,11 @@ with tab_side:
                     f"**{info['name']}** (`{info['code']}` · 비중 `{info['portfolio_weight']:.1f}%`)"
                 )
                 etf_df = pd.DataFrame(info["holdings"])[
-                    ["순위", "구성종목명", "구성종목코드", "보유비중(%)", "1개월 수익률(%)"]
+                    ["순위", "구성종목명", "구성종목코드", "보유비중(%)", "1개월 수익률(%)", "1개월 추이"]
                 ]
                 st.dataframe(
                     etf_df,
-                    use_container_width=True,
+                    width="stretch",
                     hide_index=True,
                     column_config={
                         "보유비중(%)": st.column_config.ProgressColumn(
@@ -418,19 +465,27 @@ with tab_side:
                             "1개월 수익률(%)",
                             format="%+.2f%%",
                         ),
+                        "1개월 추이": st.column_config.LineChartColumn(
+                            "1개월 추이",
+                            help="최근 1개월 일별 수익률(%) 추이",
+                        ),
                     },
                 )
 
 with tab_all:
     st.dataframe(
         export_df,
-        use_container_width=True,
+        width="stretch",
         hide_index=True,
         column_config={
             "ETF 비중(%)": st.column_config.NumberColumn("ETF 비중(%)", format="%.2f%%"),
             "보유비중(%)": st.column_config.NumberColumn("보유비중(%)", format="%.2f%%"),
             "실제 기여 비중(%)": st.column_config.NumberColumn("실제 기여 비중(%)", format="%.4f%%"),
             "1개월 수익률(%)": st.column_config.NumberColumn("1개월 수익률(%)", format="%+.2f%%"),
+            "1개월 추이": st.column_config.LineChartColumn(
+                "1개월 추이",
+                help="최근 1개월 일별 수익률(%) 추이",
+            ),
         },
     )
 
@@ -455,7 +510,7 @@ if overlap_df.empty:
 else:
     st.caption(
         f"총 **{len(overlap_df)}개** 종목이 표시됩니다. "
-        "(우측 각 ETF 컬럼의 수치는 해당 ETF 내부에서의 보유 비중 %입니다.)"
+        "(행을 클릭하면 아래에서 해당 종목의 ETF별 편입 상세를 확인할 수 있습니다.)"
     )
     etf_col_names = [
         f"{info['name']} ({info['code']}, {info['portfolio_weight']:.1f}%)"
@@ -463,43 +518,86 @@ else:
     ]
     col_cfg = {
         "1개월 수익률(%)": st.column_config.NumberColumn("1개월 수익률(%)", format="%+.2f%%"),
-        "전체 실제 비중(%)": st.column_config.NumberColumn("전체 실제 비중(%)", format="%.2f%%"),
+        "1개월 추이": st.column_config.LineChartColumn(
+            "1개월 추이",
+            help="최근 1개월 일별 수익률(%) 추이",
+        ),
+        "전체 실제 비중(%)": st.column_config.ProgressColumn(
+            "전체 실제 비중(%)",
+            format="%.2f%%",
+            min_value=0.0,
+            max_value=float(max(overlap_df["전체 실제 비중(%)"].max(), 1.0)),
+        ),
     }
     for col_name in etf_col_names:
         if col_name in overlap_df.columns:
             col_cfg[col_name] = st.column_config.NumberColumn(col_name, format="%.2f%%")
 
-    st.dataframe(
+    overlap_event = st.dataframe(
         overlap_df,
-        use_container_width=True,
+        width="stretch",
         hide_index=True,
+        on_select="rerun",
+        selection_mode="single-row",
+        key="overlap_table",
         column_config=col_cfg,
     )
 
-    chart_df = overlap_df.set_index("구성종목명")[["전체 실제 비중(%)"]]
-    st.bar_chart(chart_df, height=360)
+    selected_rows = overlap_event.selection.rows if overlap_event and overlap_event.selection else []
+    if selected_rows:
+        sel_row = overlap_df.iloc[selected_rows[0]]
+        sel_name = sel_row["구성종목명"]
+        sel_code = sel_row["구성종목코드"]
+        st.info(f"선택한 종목 상세: **{sel_name}** (`{sel_code}`) · 전체 실제 비중 **{sel_row['전체 실제 비중(%)']:.2f}%**")
+        detail_df = export_df[
+            (export_df["구성종목명"] == sel_name) & (export_df["구성종목코드"] == sel_code)
+        ].drop(columns=["1개월 추이"], errors="ignore")
+        st.dataframe(
+            detail_df,
+            width="stretch",
+            hide_index=True,
+            column_config={
+                "ETF 비중(%)": st.column_config.NumberColumn("ETF 비중(%)", format="%.2f%%"),
+                "보유비중(%)": st.column_config.NumberColumn("보유비중(%)", format="%.2f%%"),
+                "실제 기여 비중(%)": st.column_config.NumberColumn("실제 기여 비중(%)", format="%.4f%%"),
+                "1개월 수익률(%)": st.column_config.NumberColumn("1개월 수익률(%)", format="%+.2f%%"),
+            },
+        )
+
+    top_chart_df = overlap_df.head(15)[["구성종목명", "전체 실제 비중(%)"]]
+    st.bar_chart(
+        top_chart_df,
+        x="구성종목명",
+        y="전체 실제 비중(%)",
+        horizontal=True,
+        sort="-전체 실제 비중(%)",
+        height=max(320, len(top_chart_df) * 28),
+    )
 
 # 4. CSV 다운로드 버튼
 st.subheader("4. 데이터 다운로드 (Excel 호환 CSV)")
 timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 dl_col1, dl_col2 = st.columns(2)
 
+csv_export_df = export_df.drop(columns=["1개월 추이"], errors="ignore")
+csv_overlap_df = overlap_df.drop(columns=["1개월 추이"], errors="ignore")
+
 with dl_col1:
     st.download_button(
         label="📥 전체 구성종목 데이터 CSV 다운로드",
-        data=to_csv_bytes(export_df),
+        data=to_csv_bytes(csv_export_df),
         file_name=f"etf_constituents_{timestamp}.csv",
         mime="text/csv",
-        use_container_width=True,
+        width="stretch",
         type="primary",
     )
 
 with dl_col2:
-    if not overlap_df.empty:
+    if not csv_overlap_df.empty:
         st.download_button(
             label="📥 종목별 실제 비중 요약 CSV 다운로드",
-            data=to_csv_bytes(overlap_df),
+            data=to_csv_bytes(csv_overlap_df),
             file_name=f"etf_actual_weight_summary_{timestamp}.csv",
             mime="text/csv",
-            use_container_width=True,
+            width="stretch",
         )
